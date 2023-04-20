@@ -1,0 +1,183 @@
+name: Main
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - '**/README.md'
+  workflow_dispatch:
+
+env:
+  AZURE_CREDENTIALS: ${{ secrets.AZURE_CREDENTIALS }}
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        environment:
+          - dev
+    environment: ${{ matrix.environment }}
+    steps:
+      - name: 🛒 Checkout
+        id: checkout
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Install Infracost
+        run: |
+          curl https://raw.githubusercontent.com/infracost/infracost/master/scripts/install.sh | sh
+          infracost --version
+
+      - name: Install Trivy
+        run: |
+          sudo apt-get update && sudo apt-get install wget gnupg2 -y
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+          echo deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main | sudo tee -a /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update && sudo apt-get install trivy -y
+
+      - name: Run Trivy
+        run: |
+          trivy filesystem --severity HIGH,CRITICAL .
+
+      - name: Run Infracost
+        env:
+          INFRACOST_API_KEY: ${{ secrets.INFRACOST_API_KEY }}
+        run: |
+          infracost diff --path=./terraform --compare-to ./terraform/infracost-base.json
+
+      - name: Save Infracost Report
+        run: |
+          infracost diff --path=./terraform --format=json | tee infracost-report.json
+
+      - name: Upload Infracost Report
+        uses: actions/upload-artifact@v2
+        with:
+          name: infracost-report
+          path: infracost-report.json
+
+      - name: Plan changes
+        run: |
+          cd terraform
+          terraform plan -var-file="login.tfvars.json" -out=tfplan
+
+      - name: Configure Terraform
+        uses: hashicorp/setup-terraform@v1
+        with:
+          terraform_version: 1.0.0
+
+      - name: Create tfvars.file
+        run: |
+          cd terraform
+          echo '{"clientId":"${{ secrets.clientId }}","clientSecret":"${{ secrets.clientSecret }}","subscriptionId":"${{ secrets.subscriptionId }}","tenantId":"${{ secrets.tenantId }}"}' >> login.tfvars.json
+          cat login.tfvars.json
+
+      - name: Initialize Terraform
+        run: |
+          cd terraform
+          terraform init -var-file="login.tfvars.json"
+
+  terraform-apply:
+    name: Terraform Apply
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        environment:
+          - dev
+    environment: ${{ matrix.environment }}
+    steps:
+
+      - name: 🛒 Checkout
+        id: checkout
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Configure Terraform
+        uses: hashicorp/setup-terraform@v1
+        with:
+          terraform_version: 1.0.0
+
+      - name: Create tfvars.file
+        run: |
+          cd terraform
+          echo '{"clientId":"${{ secrets.clientId }}","clientSecret":"${{ secrets.clientSecret }}","subscriptionId":"${{ secrets.subscriptionId }}","tenantId":"${{ secrets.tenantId }}"}' >> login.tfvars.json
+
+      - name: Initialize Terraform
+        run: |
+          cd terraform
+          terraform init -var-file="login.tfvars.json"
+
+      - name: Plan changes
+        run: |
+          cd terraform
+          terraform plan -var-file="login.tfvars.json" -out=tfplan
+
+      - name: Apply changes
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: |
+          cd terraform
+          terraform apply -auto-approve tfplan
+
+  deploy:
+    name: Deploy
+    needs: terraform-apply
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        environment:
+          - dev
+    environment: ${{ matrix.environment }}
+    steps:
+      - name: 🛒 Checkout
+        id: checkout
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Login to GHCR
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.LEO_GITHUB_TOKEN }}
+
+      - name: Install sshpass
+        run: sudo apt-get install -y sshpass
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          images: ghcr.io/leomaiaao/publish-packages/game
+          tags: type=sha
+
+      - name: Build Docker image
+        run: |
+          cd wordpress
+          docker-compose up -d
+          docker ps -a
+          docker tag wordpress ghcr.io/leomaiaao/wordpress:latest
+          docker tag mysql:5.7 ghcr.io/leomaiaao/mysql:latest
+
+      - name: Push to GHCR
+        run: |
+          docker push ghcr.io/leomaiaao/wordpress:latest
+          docker push ghcr.io/leomaiaao/mysql:latest
+
+      - name: Add SSH host key to known_hosts
+        run: mkdir -p ~/.ssh && ssh-keyscan 20.51.151.194 > ~/.ssh/known_hosts
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y ansible
+      - name: Run Ansible playbook
+        run: |
+          cd ansible
+          ansible-playbook -i hosts.yml playbook.yaml -e "LEO_GITHUB_TOKEN=${{ secrets.LEO_GITHUB_TOKEN }}"
